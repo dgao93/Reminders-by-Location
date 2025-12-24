@@ -53,6 +53,7 @@ const FONT_MEDIUM = 'System';
 const FONT_BOLD = 'System';
 const TAB_BAR_HEIGHT = 56;
 const DEFAULT_LOCATION_RADIUS_METERS = 100;
+const LOCATION_LAST_KNOWN_MAX_AGE_MS = 30000;
 const DEFAULT_QUIET_HOURS: QuietHours = {
   enabled: false,
   startMinutesFromMidnight: 22 * 60,
@@ -161,6 +162,7 @@ function AppContent() {
     foreground: boolean;
     background: boolean;
   } | null>(null);
+  const [locationDebugInfo, setLocationDebugInfo] = useState<Record<string, string>>({});
   const [authorizationStatus, setAuthorizationStatus] = useState<'authorized' | 'denied' | 'unknown'>(
     'unknown'
   );
@@ -410,6 +412,85 @@ function AppContent() {
     }
     void syncGeofencing();
   }, [locations, locationRadiusMeters, locationScheduleSignature, isHydrated]);
+
+  useEffect(() => {
+    if (!isHydrated || activeTab !== 'home') {
+      return;
+    }
+    const locationSchedules = schedules.filter((schedule) => schedule.locationId);
+    if (locationSchedules.length === 0) {
+      setLocationDebugInfo({});
+      return;
+    }
+    let isCancelled = false;
+    const refresh = async () => {
+      const foreground = await Location.getForegroundPermissionsAsync();
+      if (!foreground.granted) {
+        const next = Object.fromEntries(
+          locationSchedules.map((schedule) => [
+            schedule.id,
+            'Location status: permission not granted.',
+          ])
+        );
+        if (!isCancelled) {
+          setLocationDebugInfo(next);
+        }
+        return;
+      }
+      const background = await Location.getBackgroundPermissionsAsync();
+      const fix = await getLocationFix();
+      if (!fix) {
+        const next = Object.fromEntries(
+          locationSchedules.map((schedule) => [
+            schedule.id,
+            'Location status: unable to read GPS.',
+          ])
+        );
+        if (!isCancelled) {
+          setLocationDebugInfo(next);
+        }
+        return;
+      }
+      const next: Record<string, string> = {};
+      for (const schedule of locationSchedules) {
+        const target = schedule.locationId ? getLocationTarget(schedule.locationId) : null;
+        if (!target) {
+          next[schedule.id] = 'Location status: saved location missing.';
+          continue;
+        }
+        const distance = Math.round(distanceInMeters(fix.coords, target));
+        const inside = distance <= locationRadiusMeters;
+        const ageSeconds = Math.round(fix.ageMs / 1000);
+        const accuracyMeters =
+          typeof fix.accuracyMeters === 'number' ? Math.round(fix.accuracyMeters) : null;
+        let detail = `Location status: ${distance} m from ${target.name} (${inside ? 'inside' : 'outside'} ${locationRadiusMeters} m).`;
+        if (Number.isFinite(ageSeconds)) {
+          detail += ` GPS age ${ageSeconds}s.`;
+        }
+        if (accuracyMeters !== null) {
+          detail += ` Accuracy ~${accuracyMeters}m.`;
+        }
+        if (!background.granted) {
+          detail += ' Background "Always" is off.';
+        }
+        next[schedule.id] = detail;
+      }
+      if (!isCancelled) {
+        setLocationDebugInfo(next);
+      }
+    };
+    void refresh();
+    return () => {
+      isCancelled = true;
+    };
+  }, [
+    activeTab,
+    isHydrated,
+    locationRadiusMeters,
+    locationScheduleSignature,
+    locations,
+    schedules,
+  ]);
 
   useEffect(() => {
     if (!isHydrated) {
@@ -737,22 +818,37 @@ function AppContent() {
     return true;
   };
 
-  const getCurrentCoords = async () => {
+  const getLocationFix = async () => {
     if (Platform.OS === 'web') {
       return null;
     }
     try {
-      const lastKnown = await Location.getLastKnownPositionAsync();
+      const lastKnown = await Location.getLastKnownPositionAsync({
+        maxAge: LOCATION_LAST_KNOWN_MAX_AGE_MS,
+      });
       if (lastKnown?.coords) {
-        return lastKnown.coords;
+        return {
+          coords: lastKnown.coords,
+          ageMs: Math.max(0, Date.now() - lastKnown.timestamp),
+          accuracyMeters: lastKnown.coords.accuracy ?? null,
+        };
       }
       const current = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Balanced,
+        accuracy: Location.Accuracy.High,
       });
-      return current.coords;
+      return {
+        coords: current.coords,
+        ageMs: Math.max(0, Date.now() - current.timestamp),
+        accuracyMeters: current.coords.accuracy ?? null,
+      };
     } catch {
       return null;
     }
+  };
+
+  const getCurrentCoords = async () => {
+    const fix = await getLocationFix();
+    return fix?.coords ?? null;
   };
 
   const isScheduleLocationEligible = async (
@@ -993,17 +1089,16 @@ function AppContent() {
       return;
     }
     try {
-      const lastKnown = await Location.getLastKnownPositionAsync();
-      const current = lastKnown
-        ? lastKnown
-        : await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.Balanced,
-          });
-      const coords = {
-        latitude: current.coords.latitude,
-        longitude: current.coords.longitude,
-      };
-      await saveLocationFromCoords(name, coords, locationId);
+      const coords = await getCurrentCoords();
+      if (!coords) {
+        Alert.alert('Location error', 'Unable to read your location.');
+        return;
+      }
+      await saveLocationFromCoords(
+        name,
+        { latitude: coords.latitude, longitude: coords.longitude },
+        locationId
+      );
     } catch {
       Alert.alert('Location error', 'Unable to read your location.');
     }
@@ -1057,6 +1152,14 @@ function AppContent() {
         'Unable to open Settings',
         'Open the Settings app to adjust location permissions.'
       );
+    });
+  };
+
+  const requestLocationAccess = async () => {
+    const requireBackground = needsLocationBackground || hasLocationSchedules;
+    await requestLocationPermissions({
+      requireBackground,
+      explainBackground: requireBackground,
     });
   };
 
@@ -1623,6 +1726,7 @@ function AppContent() {
               schedule.endMinutesFromMidnight
             );
             const locationLabel = getLocationLabel(schedule.locationId);
+            const locationDebugLine = locationDebugInfo[schedule.id];
             const summary = `${daysSummary} | ${timeSummary} | Every ${schedule.intervalMinutes} min | ${locationLabel}`;
             const isCollapsed = collapsedSchedules.includes(schedule.id);
             return (
@@ -1846,6 +1950,11 @@ function AppContent() {
                         {locationLabel}
                       </Text>
                     </Pressable>
+                    {schedule.locationId ? (
+                      <Text style={[styles.helperText, { color: colors.textMuted }]}>
+                        {locationDebugLine ?? 'Location status: checking...'}
+                      </Text>
+                    ) : null}
 
                   </>
                 ) : null}
@@ -1983,10 +2092,10 @@ function AppContent() {
                 </Text>
                 <Pressable
                   style={[styles.secondaryButton, { borderColor: colors.border }]}
-                  onPress={openSystemSettings}
+                  onPress={requestLocationAccess}
                 >
                   <Text style={[styles.secondaryButtonLabel, { color: colors.textPrimary }]}>
-                    Open iOS Settings
+                    Enable Location
                   </Text>
                 </Pressable>
               </>
