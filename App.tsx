@@ -1807,7 +1807,7 @@ function AppContent() {
                   <TextInput
                     value={detailSchedule.name ?? ''}
                     onChangeText={(value) => updateSchedule(detailSchedule.id, { name: value })}
-                    onFocus={() => updateSchedule(detailSchedule.id, { name: '' })}
+                    selectTextOnFocus
                     placeholder="Reminder"
                     placeholderTextColor={colors.placeholder}
                     style={[styles.detailRowInput, { color: colors.textPrimary }]}
@@ -1821,7 +1821,7 @@ function AppContent() {
                   <TextInput
                     value={detailSchedule.message ?? ''}
                     onChangeText={(value) => updateSchedule(detailSchedule.id, { message: value })}
-                    onFocus={() => updateSchedule(detailSchedule.id, { message: '' })}
+                    selectTextOnFocus
                     placeholder="Don't forget!"
                     placeholderTextColor={colors.placeholder}
                     style={[styles.detailRowInput, { color: colors.textPrimary }]}
